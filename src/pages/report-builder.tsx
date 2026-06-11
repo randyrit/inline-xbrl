@@ -5,10 +5,9 @@ import { Avatar } from "@/components/base/avatar/avatar";
 import { Badge, BadgeWithDot } from "@/components/base/badges/badges";
 import { Button } from "@/components/base/buttons/button";
 import { Tab, TabList, Tabs } from "@/components/application/tabs/tabs";
-import { Tooltip } from "@/components/base/tooltip/tooltip";
+import { Tooltip, TooltipTrigger } from "@/components/base/tooltip/tooltip";
 import { usePresence } from "@/hooks/use-presence";
 import type { RemoteEdit } from "@/hooks/use-presence";
-import { identityInitials } from "@/lib/identity";
 import { COLLABORATORS, CURRENT_USER } from "@/lib/initial-data";
 import type { DocType, Statement, StatementRow } from "@/lib/types";
 import { COMPANY, DOC_META, autoTag, conceptShortName, formatAccounting, isBalanced, resolveValue, tagStats } from "@/lib/xbrl";
@@ -45,21 +44,78 @@ interface CursorTarget {
     sim?: boolean;
 }
 
+interface StackPerson {
+    id: string;
+    name: string;
+    color: string;
+    avatar?: string;
+}
+
+const personInitials = (name: string): string =>
+    name
+        .split(" ")
+        .filter((word) => !word.startsWith("("))
+        .map((word) => word[0])
+        .slice(0, 2)
+        .join("")
+        .toUpperCase();
+
+/** Avatar stack with hover tooltips. Shows at most 5 people; the rest collapse
+    into a "+#" circle whose tooltip lists who they are. */
+const PresenceStack = ({ people }: { people: StackPerson[] }) => {
+    const MAX_VISIBLE = 5;
+    const visible = people.slice(0, MAX_VISIBLE);
+    const extra = people.slice(MAX_VISIBLE);
+
+    return (
+        <div className="flex -space-x-2">
+            {visible.map((person) => (
+                <Tooltip key={person.id} title={person.name} arrow>
+                    <TooltipTrigger aria-label={person.name} className="rounded-full">
+                        {person.avatar ? (
+                            <Avatar src={person.avatar} alt={person.name} size="xs" className="ring-[1.5px] ring-bg-primary" />
+                        ) : (
+                            <span
+                                className="flex size-6 items-center justify-center rounded-full text-[9px] font-bold text-white ring-[1.5px] ring-bg-primary"
+                                style={{ backgroundColor: person.color }}
+                            >
+                                {personInitials(person.name)}
+                            </span>
+                        )}
+                    </TooltipTrigger>
+                </Tooltip>
+            ))}
+            {extra.length > 0 && (
+                <Tooltip
+                    title={`${extra.length} more ${extra.length === 1 ? "person" : "people"} online`}
+                    description={extra.map((person) => person.name).join(", ")}
+                    arrow
+                >
+                    <TooltipTrigger aria-label={`${extra.length} more people online`} className="rounded-full">
+                        <span className="flex size-6 items-center justify-center rounded-full bg-secondary-solid text-[9px] font-bold text-white ring-[1.5px] ring-bg-primary">
+                            +{extra.length}
+                        </span>
+                    </TooltipTrigger>
+                </Tooltip>
+            )}
+        </div>
+    );
+};
+
 const pickRandomCell = (statement: Statement): CellRef => {
     const candidates = statement.rows.filter((r) => r.kind !== "header");
     const row = candidates[Math.floor(Math.random() * candidates.length)];
     return { rowId: row.id, col: Math.floor(Math.random() * 2) };
 };
 
-/** Floating named cursor, Google-Sheets style. Simulated teammates glide slowly;
-    real remote cursors track quickly so they feel live. */
-const CollaboratorCursor = ({ person, x, y, sim }: { person: PresencePerson; x: number; y: number; sim?: boolean }) => (
+/** Floating named cursor, Google-Sheets style. Position is driven imperatively by a
+    requestAnimationFrame loop (no CSS transitions), so remote cursors glide at 60fps
+    even though network updates arrive in bursts. */
+const CollaboratorCursor = ({ person, cursorRef }: { person: PresencePerson; cursorRef: (el: HTMLDivElement | null) => void }) => (
     <div
-        className={cx(
-            "pointer-events-none absolute z-30 transition-all",
-            sim ? "duration-[1600ms] ease-[cubic-bezier(0.22,1,0.36,1)]" : "duration-150 ease-linear",
-        )}
-        style={{ transform: `translate(${x}px, ${y}px)` }}
+        ref={cursorRef}
+        className="pointer-events-none absolute top-0 left-0 z-30 will-change-transform"
+        style={{ transform: "translate(-200px, -200px)" }}
     >
         <svg width="14" height="16" viewBox="0 0 14 16" className="drop-shadow-sm">
             <path d="M1 1l5.2 13 1.9-5.4L13.5 7z" fill={person.color} stroke="white" strokeWidth="1" />
@@ -222,8 +278,11 @@ export const ReportBuilder = () => {
     const [aiRunning, setAiRunning] = useState(false);
     const [scanRowId, setScanRowId] = useState<string | null>(null);
     const [selections, setSelections] = useState<SelectionMap>({});
-    const [cursors, setCursors] = useState<Record<string, { x: number; y: number }>>({});
     const gridRef = useRef<HTMLDivElement>(null);
+    /* Cursor animation state lives outside React: targets come from presence messages,
+       a rAF loop eases the visible position toward them every frame. */
+    const cursorEls = useRef<Map<string, HTMLDivElement>>(new Map());
+    const cursorMotion = useRef<Record<string, { tx: number; ty: number; x: number; y: number; sim: boolean }>>({});
 
     /* Real-time presence: live cursors from anyone else on this page. */
     const onRemoteEdit = useCallback(
@@ -292,36 +351,65 @@ export const ReportBuilder = () => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [selections, peers, hasRealPeers, doc, statement.id]);
 
-    /* Convert cell targets to pixel cursor positions. */
-    const positionCursors = useCallback(() => {
+    /* Convert cell targets to pixel positions and feed them to the animation loop. */
+    const updateCursorTargets = useCallback(() => {
         const grid = gridRef.current;
         if (!grid) return;
         const gridRect = grid.getBoundingClientRect();
-        setCursors(() => {
-            const next: Record<string, { x: number; y: number }> = {};
-            const sharedCount: Record<string, number> = {};
-            for (const target of cursorTargets) {
-                const cell = grid.querySelector(`[data-cell="${target.rowId}:${target.col}"]`);
-                if (!cell) continue;
-                /* Fan out cursors that share a cell so the arrows stay distinguishable. */
-                const key = `${target.rowId}:${target.col}`;
-                const stackIndex = sharedCount[key] ?? 0;
-                sharedCount[key] = stackIndex + 1;
-                const rect = cell.getBoundingClientRect();
-                next[target.person.id] = {
-                    x: rect.left - gridRect.left + rect.width * target.fx + grid.scrollLeft + stackIndex * 16,
-                    y: rect.top - gridRect.top + rect.height * target.fy + grid.scrollTop + stackIndex * 6,
-                };
+        const sharedCount: Record<string, number> = {};
+        const seen = new Set<string>();
+        for (const target of cursorTargets) {
+            const cell = grid.querySelector(`[data-cell="${target.rowId}:${target.col}"]`);
+            if (!cell) continue;
+            /* Fan out cursors that share a cell so the arrows stay distinguishable. */
+            const key = `${target.rowId}:${target.col}`;
+            const stackIndex = sharedCount[key] ?? 0;
+            sharedCount[key] = stackIndex + 1;
+            const rect = cell.getBoundingClientRect();
+            const x = rect.left - gridRect.left + rect.width * target.fx + grid.scrollLeft + stackIndex * 16;
+            const y = rect.top - gridRect.top + rect.height * target.fy + grid.scrollTop + stackIndex * 6;
+
+            const id = target.person.id;
+            seen.add(id);
+            const motion = cursorMotion.current[id];
+            if (!motion) {
+                /* New cursor: appear in place rather than flying in from offscreen. */
+                cursorMotion.current[id] = { tx: x, ty: y, x, y, sim: !!target.sim };
+                cursorEls.current.get(id)?.style.setProperty("transform", `translate(${x}px, ${y}px)`);
+            } else {
+                motion.tx = x;
+                motion.ty = y;
+                motion.sim = !!target.sim;
             }
-            return next;
-        });
+        }
+        for (const id of Object.keys(cursorMotion.current)) {
+            if (!seen.has(id)) delete cursorMotion.current[id];
+        }
     }, [cursorTargets]);
 
     useLayoutEffect(() => {
-        positionCursors();
-        window.addEventListener("resize", positionCursors);
-        return () => window.removeEventListener("resize", positionCursors);
-    }, [positionCursors]);
+        updateCursorTargets();
+        window.addEventListener("resize", updateCursorTargets);
+        return () => window.removeEventListener("resize", updateCursorTargets);
+    }, [updateCursorTargets]);
+
+    /* 60fps easing loop: real cursors snap-follow (~80ms settle), sims drift lazily. */
+    useEffect(() => {
+        let raf = 0;
+        const tick = () => {
+            for (const [id, motion] of Object.entries(cursorMotion.current)) {
+                const el = cursorEls.current.get(id);
+                if (!el) continue;
+                const k = motion.sim ? 0.06 : 0.45;
+                motion.x += (motion.tx - motion.x) * k;
+                motion.y += (motion.ty - motion.y) * k;
+                el.style.transform = `translate(${motion.x}px, ${motion.y}px)`;
+            }
+            raf = requestAnimationFrame(tick);
+        };
+        raf = requestAnimationFrame(tick);
+        return () => cancelAnimationFrame(raf);
+    }, []);
 
     /* Broadcast my own cursor as I move over the grid. */
     const handleGridMouseMove = useCallback(
@@ -428,36 +516,19 @@ export const ReportBuilder = () => {
                     <div className="flex items-center gap-4">
                         {/* Live presence: you + real peers (or simulated teammates while alone) */}
                         <div className="flex items-center gap-2">
-                            <div className="flex -space-x-2">
-                                {identity.isAccount ? (
-                                    <Avatar src={CURRENT_USER.avatar} alt={CURRENT_USER.name} size="xs" className="ring-[1.5px] ring-bg-primary" />
-                                ) : (
-                                    <span
-                                        title={`${identity.name} (you)`}
-                                        className="flex size-6 items-center justify-center rounded-full text-[9px] font-bold text-white ring-[1.5px] ring-bg-primary"
-                                        style={{ backgroundColor: identity.color }}
-                                    >
-                                        {identityInitials(identity)}
-                                    </span>
-                                )}
-                                {hasRealPeers
-                                    ? peerList.map((peer) => (
-                                          <span
-                                              key={peer.id}
-                                              title={peer.name}
-                                              className="flex size-6 items-center justify-center rounded-full text-[9px] font-bold text-white ring-[1.5px] ring-bg-primary"
-                                              style={{ backgroundColor: peer.color }}
-                                          >
-                                              {peer.name
-                                                  .split(" ")
-                                                  .map((w) => w[0])
-                                                  .slice(0, 2)
-                                                  .join("")
-                                                  .toUpperCase()}
-                                          </span>
-                                      ))
-                                    : COLLABORATORS.map((c) => <Avatar key={c.id} src={c.avatar} alt={c.name} size="xs" className="ring-[1.5px] ring-bg-primary" />)}
-                            </div>
+                            <PresenceStack
+                                people={[
+                                    {
+                                        id: "me",
+                                        name: `${identity.isAccount ? CURRENT_USER.name : identity.name} (you)`,
+                                        color: identity.color,
+                                        avatar: identity.isAccount ? CURRENT_USER.avatar : undefined,
+                                    },
+                                    ...(hasRealPeers
+                                        ? peerList.map((peer) => ({ id: peer.id, name: peer.name, color: peer.color }))
+                                        : COLLABORATORS.map((c) => ({ id: c.id, name: c.name, color: c.color, avatar: c.avatar }))),
+                                ]}
+                            />
                             <BadgeWithDot color={connected ? "success" : "gray"} size="sm" type="pill-color">
                                 {connected ? `${(hasRealPeers ? peerList.length : COLLABORATORS.length) + 1} online` : "Connecting…"}
                             </BadgeWithDot>
@@ -523,18 +594,16 @@ export const ReportBuilder = () => {
             {/* Spreadsheet grid */}
             <div ref={gridRef} onMouseMove={handleGridMouseMove} className="relative flex-1 overflow-auto bg-primary">
                 {/* Collaborator cursors — simulated teammates or real remote visitors */}
-                {cursorTargets.map(
-                    (target) =>
-                        cursors[target.person.id] && (
-                            <CollaboratorCursor
-                                key={target.person.id}
-                                person={target.person}
-                                x={cursors[target.person.id].x}
-                                y={cursors[target.person.id].y}
-                                sim={target.sim}
-                            />
-                        ),
-                )}
+                {cursorTargets.map((target) => (
+                    <CollaboratorCursor
+                        key={target.person.id}
+                        person={target.person}
+                        cursorRef={(el) => {
+                            if (el) cursorEls.current.set(target.person.id, el);
+                            else cursorEls.current.delete(target.person.id);
+                        }}
+                    />
+                ))}
 
                 <table className="w-full min-w-[960px] border-collapse">
                     <thead className="sticky top-0 z-20 bg-secondary_subtle">

@@ -13,8 +13,10 @@ Built with **React 19 + Untitled UI React + React Aria + Tailwind CSS v4** (Vite
    second browser/incognito window.
 3. Everyone who joins appears with a randomly generated **anonymous name**
    (`Color Expression Animal`, e.g. *Orange Happy Bamboo*) and a matching cursor color.
-   Watch each other's cursors, co-selected cells (names stack horizontally with a `+#`
-   overflow chip), and live cell edits.
+   Watch each other's cursors move in realtime (60fps interpolated), co-selected cells
+   (names stack horizontally with a `+#` overflow chip), and live cell edits. Hover the
+   avatar stack in the header to see who's online — at most 5 avatars show, with a `+#`
+   circle for the rest.
 4. Use the **sign-in icon** on the profile card (bottom of the left nav) to enter the demo
    account — signed-in users show their real display name (Randy Ritts) instead of an
    anonymous one.

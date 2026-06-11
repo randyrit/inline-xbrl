@@ -14,7 +14,8 @@ const TOPIC = `inline-xbrl-demo/${room}/v1`;
 
 const HEARTBEAT_MS = 4000;
 const PEER_TIMEOUT_MS = 12000;
-const CURSOR_THROTTLE_MS = 90;
+/* ~30 updates/sec — receivers interpolate between them, so motion reads as realtime. */
+const CURSOR_THROTTLE_MS = 35;
 
 export interface PeerCursor {
     stmtId: string;
@@ -58,6 +59,8 @@ export const usePresence = (identity: Identity, onRemoteEdit: (edit: RemoteEdit)
     const onRemoteEditRef = useRef(onRemoteEdit);
     onRemoteEditRef.current = onRemoteEdit;
     const lastCursorSent = useRef(0);
+    const pendingCursor = useRef<PeerCursor | null>(null);
+    const flushTimer = useRef<number | null>(null);
 
     const publish = useCallback((msg: WireMessage) => {
         const client = clientRef.current;
@@ -159,13 +162,37 @@ export const usePresence = (identity: Identity, onRemoteEdit: (edit: RemoteEdit)
 
     const sendCursor = useCallback(
         (cursor: PeerCursor) => {
-            const now = Date.now();
-            if (now - lastCursorSent.current < CURSOR_THROTTLE_MS) return;
-            lastCursorSent.current = now;
-            const me = identityRef.current;
-            publish({ t: "cur", id: me.id, name: me.name, color: me.color, acct: me.isAccount, ...cursor });
+            const sendNow = (c: PeerCursor) => {
+                lastCursorSent.current = Date.now();
+                const me = identityRef.current;
+                publish({ t: "cur", id: me.id, name: me.name, color: me.color, acct: me.isAccount, ...c });
+            };
+
+            const elapsed = Date.now() - lastCursorSent.current;
+            if (elapsed >= CURSOR_THROTTLE_MS) {
+                sendNow(cursor);
+                return;
+            }
+            /* Trailing flush: the final resting position always goes out. */
+            pendingCursor.current = cursor;
+            if (flushTimer.current === null) {
+                flushTimer.current = window.setTimeout(() => {
+                    flushTimer.current = null;
+                    if (pendingCursor.current) {
+                        sendNow(pendingCursor.current);
+                        pendingCursor.current = null;
+                    }
+                }, CURSOR_THROTTLE_MS - elapsed);
+            }
         },
         [publish],
+    );
+
+    useEffect(
+        () => () => {
+            if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
+        },
+        [],
     );
 
     const sendEdit = useCallback(
