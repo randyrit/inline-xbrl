@@ -7,7 +7,7 @@ import { Button } from "@/components/base/buttons/button";
 import { Tab, TabList, Tabs } from "@/components/application/tabs/tabs";
 import { Tooltip, TooltipTrigger } from "@/components/base/tooltip/tooltip";
 import { usePresence } from "@/hooks/use-presence";
-import type { CursorEvent, RemoteEdit } from "@/hooks/use-presence";
+import type { CursorEvent, RemoteEdit, SelectEvent } from "@/hooks/use-presence";
 import { COLLABORATORS, CURRENT_USER } from "@/lib/initial-data";
 import type { DocType, Statement, StatementRow } from "@/lib/types";
 import { COMPANY, DOC_META, autoTag, conceptShortName, formatAccounting, isBalanced, resolveValue, tagStats } from "@/lib/xbrl";
@@ -138,12 +138,15 @@ const ValueCell = ({
     col,
     statement,
     onCommit,
+    onSelectChange,
     selectedBy,
 }: {
     row: StatementRow;
     col: number;
     statement: Statement;
     onCommit: (value: number | null) => void;
+    /** Notifies when this cell is clicked into / left, to broadcast the selection. */
+    onSelectChange?: (focused: boolean) => void;
     selectedBy?: PresencePerson[];
 }) => {
     const isComputed = row.kind === "subtotal" || row.kind === "total";
@@ -196,9 +199,13 @@ const ValueCell = ({
                 ) : (
                     <input
                         value={draft ?? display}
-                        onFocus={() => setDraft(value === null ? "" : String(value))}
+                        onFocus={() => {
+                            setDraft(value === null ? "" : String(value));
+                            onSelectChange?.(true);
+                        }}
                         onChange={(e) => setDraft(e.target.value)}
                         onBlur={() => {
+                            onSelectChange?.(false);
                             if (draft !== null) {
                                 const cleaned = draft.replace(/[,$\s]/g, "").replace(/^\((.*)\)$/, "-$1");
                                 const n = cleaned === "" ? null : Number(cleaned);
@@ -362,6 +369,34 @@ export const ReportBuilder = () => {
         [computeCellPos],
     );
 
+    /* Cells peers are actively working in (clicked/focused) — drives the colored
+       outline + name flag on the cell, persisting until they leave it. */
+    const [peerSelections, setPeerSelections] = useState<Record<string, { id: string; name: string; color: string; cellKey: string; doc: string; stmtId: string }>>(
+        {},
+    );
+
+    const onSelect = useCallback((event: SelectEvent) => {
+        setPeerSelections((prev) => {
+            if (!event.selection) {
+                if (!(event.peer.id in prev)) return prev;
+                const next = { ...prev };
+                delete next[event.peer.id];
+                return next;
+            }
+            return {
+                ...prev,
+                [event.peer.id]: {
+                    id: event.peer.id,
+                    name: event.peer.name,
+                    color: event.peer.color,
+                    cellKey: event.selection.cell,
+                    doc: event.selection.doc,
+                    stmtId: event.selection.stmtId,
+                },
+            };
+        });
+    }, []);
+
     const onLeave = useCallback((peerId: string) => {
         delete peerCursorsRef.current[peerId];
         delete cursorMotion.current[peerId];
@@ -371,9 +406,15 @@ export const ReportBuilder = () => {
             delete next[peerId];
             return next;
         });
+        setPeerSelections((prev) => {
+            if (!(peerId in prev)) return prev;
+            const next = { ...prev };
+            delete next[peerId];
+            return next;
+        });
     }, []);
 
-    const { peers, connected, sendCursor, sendEdit, room } = usePresence(identity, { onRemoteEdit, onCursor, onLeave });
+    const { peers, connected, sendCursor, sendEdit, sendSelect, room } = usePresence(identity, { onRemoteEdit, onCursor, onSelect, onLeave });
     const peerList = Object.values(peers);
     /* Simulated teammates only keep you company while you're alone. */
     const hasRealPeers = peerList.length > 0;
@@ -510,6 +551,13 @@ export const ReportBuilder = () => {
         return () => cancelAnimationFrame(raf);
     }, []);
 
+    /* Leaving the statement/document clears my broadcast selection (the focused
+       input unmounts without firing blur). */
+    useEffect(() => {
+        return () => sendSelect(null);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [doc, statement.id]);
+
     /* Broadcast my own cursor as I move anywhere over the grid — every cell
        (labels, column headers, tags, sources) carries a data-cell anchor. */
     const handleGridMouseMove = useCallback(
@@ -584,13 +632,21 @@ export const ReportBuilder = () => {
         toast({ title: "All suggestions accepted", description: "Tag coverage updated across the document.", color: "success" });
     };
 
+    /* Cells to ring: simulated teammates' wandering picks (solo mode) plus the
+       cells real peers have clicked into. Hover cursors don't ring — only active
+       selections do, so the outline means "someone is working here". */
     const selectionByRow = useMemo(() => {
         const map: Record<string, PresencePerson[]> = {};
         for (const target of cursorTargets) {
-            (map[target.cellKey] ??= []).push(target.person);
+            if (target.sim) (map[target.cellKey] ??= []).push(target.person);
+        }
+        for (const sel of Object.values(peerSelections)) {
+            if (sel.doc === doc && sel.stmtId === statement.id) {
+                (map[sel.cellKey] ??= []).push({ id: sel.id, name: sel.name, color: sel.color });
+            }
         }
         return map;
-    }, [cursorTargets]);
+    }, [cursorTargets, peerSelections, doc, statement.id]);
 
     return (
         <div className="flex h-[calc(100dvh-56px)] flex-col lg:h-dvh">
@@ -760,6 +816,9 @@ export const ReportBuilder = () => {
                                                 dispatch({ type: "SET_CELL", doc, stmtId: statement.id, rowId: row.id, col, value });
                                                 sendEdit({ doc, stmtId: statement.id, rowId: row.id, col, value });
                                             }}
+                                            onSelectChange={(focused) =>
+                                                sendSelect(focused ? { doc, stmtId: statement.id, cell: `${row.id}:${col}` } : null)
+                                            }
                                         />
                                     ))}
                                     <TagCell

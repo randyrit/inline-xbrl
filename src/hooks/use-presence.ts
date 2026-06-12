@@ -52,16 +52,31 @@ export interface CursorEvent {
     cursor: PeerCursor;
 }
 
+/** A cell someone is actively working in (clicked/focused) — null clears it. */
+export interface PeerSelection {
+    doc: string;
+    stmtId: string;
+    cell: string;
+}
+
+export interface SelectEvent {
+    peer: Peer;
+    selection: PeerSelection | null;
+}
+
 type WireMessage =
     | { t: "hello"; id: string; name: string; color: string; acct: boolean }
     | { t: "bye"; id: string }
     | ({ t: "cur"; id: string; name: string; color: string; acct: boolean } & PeerCursor)
+    | { t: "sel"; id: string; name: string; color: string; acct: boolean; sel: PeerSelection | null }
     | { t: "edit"; id: string; doc: string; stmtId: string; rowId: string; col: number; value: number | null };
 
 export interface PresenceHandlers {
     onRemoteEdit: (edit: RemoteEdit) => void;
     /** Fired for every cursor packet — called outside React state, at network rate. */
     onCursor: (event: CursorEvent) => void;
+    /** Fired when a peer clicks into (or leaves) a cell. */
+    onSelect: (event: SelectEvent) => void;
     /** Fired when a peer disconnects or times out. */
     onLeave?: (peerId: string) => void;
 }
@@ -78,15 +93,22 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
     const lastCursorSent = useRef(0);
     const pendingCursor = useRef<PeerCursor | null>(null);
     const flushTimer = useRef<number | null>(null);
+    const mySelection = useRef<PeerSelection | null>(null);
 
-    const publish = useCallback((msg: WireMessage) => {
+    /* Cursors are fire-and-forget (qos 0); edits and selections matter, so they
+       use acknowledged delivery (qos 1) — a single dropped packet won't lose them. */
+    const publish = useCallback((msg: WireMessage, qos: 0 | 1 = 0) => {
         const client = clientRef.current;
-        if (client?.connected) client.publish(TOPIC, JSON.stringify(msg));
+        if (client?.connected) client.publish(TOPIC, JSON.stringify(msg), { qos });
     }, []);
 
     const hello = useCallback(() => {
         const me = identityRef.current;
         publish({ t: "hello", id: me.id, name: me.name, color: me.color, acct: me.isAccount });
+        /* Late joiners need to learn about an already-active selection. */
+        if (mySelection.current) {
+            publish({ t: "sel", id: me.id, name: me.name, color: me.color, acct: me.isAccount, sel: mySelection.current });
+        }
     }, [publish]);
 
     const removePeer = useCallback((id: string) => {
@@ -140,8 +162,8 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
                 return;
             }
 
-            /* hello | cur: keep the roster in sync, but only re-render React when
-               someone new joins or an identity actually changes. */
+            /* hello | cur | sel: keep the roster in sync, but only re-render React
+               when someone new joins or an identity actually changes. */
             const peer: Peer = { id: msg.id, name: msg.name, color: msg.color, isAccount: msg.acct };
             setPeers((prev) => {
                 const existing = prev[msg.id];
@@ -155,6 +177,8 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
 
             if (msg.t === "cur") {
                 handlersRef.current.onCursor({ peer, cursor: { stmtId: msg.stmtId, doc: msg.doc, cell: msg.cell, fx: msg.fx, fy: msg.fy } });
+            } else if (msg.t === "sel") {
+                handlersRef.current.onSelect({ peer, selection: msg.sel });
             }
         });
 
@@ -215,9 +239,25 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
     );
 
     const sendEdit = useCallback(
-        (edit: RemoteEdit) => publish({ t: "edit", id: identityRef.current.id, ...edit }),
+        (edit: RemoteEdit) => {
+            const msg: WireMessage = { t: "edit", id: identityRef.current.id, ...edit };
+            publish(msg, 1);
+            /* SET_CELL is idempotent, so re-send once — covers a receiver that was
+               mid-reconnect on the public broker when the first copy went out. */
+            window.setTimeout(() => publish(msg, 1), 700);
+        },
         [publish],
     );
 
-    return { peers, connected, sendCursor, sendEdit, room };
+    /** Broadcast which cell I'm working in (null = stopped editing). */
+    const sendSelect = useCallback(
+        (selection: PeerSelection | null) => {
+            mySelection.current = selection;
+            const me = identityRef.current;
+            publish({ t: "sel", id: me.id, name: me.name, color: me.color, acct: me.isAccount, sel: selection }, 1);
+        },
+        [publish],
+    );
+
+    return { peers, connected, sendCursor, sendEdit, sendSelect, room };
 };
