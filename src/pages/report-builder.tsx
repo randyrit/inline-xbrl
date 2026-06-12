@@ -33,6 +33,36 @@ interface CellRef {
 
 type SelectionMap = Record<string, CellRef>;
 
+interface CursorSample {
+    x: number;
+    y: number;
+    t: number;
+}
+
+interface CursorMotion {
+    /** Currently rendered position. */
+    x: number;
+    y: number;
+    /** Latest known target — fallback when the sample buffer runs dry. */
+    tx: number;
+    ty: number;
+    sim: boolean;
+    /** Timestamped position samples for jitter-buffered path replay. */
+    buffer: CursorSample[];
+    /** Recent (arrivalTime − senderTime) deltas; their min estimates clock offset
+        + fastest network path, their spread measures jitter. */
+    latWindow: number[];
+    /** Replay delay sized to recent jitter; the loop eases toward it. */
+    delay: number;
+    targetDelay: number;
+    /** Monotonic guard: replay time never runs backward while delay adapts. */
+    lastRenderT: number;
+}
+
+/* Replay delay bounds: enough to bridge broker jitter, small enough to feel live. */
+const MIN_DELAY_MS = 110;
+const MAX_DELAY_MS = 600;
+
 /** Where a person's cursor should render: a cell anchor key plus a fractional offset inside it. */
 interface CursorTarget {
     person: PresencePerson;
@@ -156,14 +186,22 @@ const ValueCell = ({
     if (row.kind === "header") return <td className="px-4 py-2" data-cell={`${row.id}:${col}`} />;
 
     const display = formatAccounting(value);
-    /* One inset ring per selector, nested outside-in so every color stays visible. */
+    /* One inset ring per selector, nested outside-in so every color stays visible,
+       plus a translucent fill in the first selector's color so an occupied cell
+       reads as highlighted from across the table. */
     const ring = selectedBy?.length
-        ? { boxShadow: selectedBy.slice(0, 3).map((person, i) => `inset 0 0 0 ${(i + 1) * 2}px ${person.color}`).join(", ") }
+        ? {
+              boxShadow: selectedBy.slice(0, 3).map((person, i) => `inset 0 0 0 ${(i + 1) * 2}px ${person.color}`).join(", "),
+              backgroundColor: `${selectedBy[0].color}1F`,
+          }
         : undefined;
 
     return (
         <td className="relative p-0" data-cell={`${row.id}:${col}`}>
-            <div className="relative" style={ring}>
+            <div className="relative">
+                {/* Painted above the input so the highlight survives the input's own
+                    hover/focus/empty backgrounds. */}
+                {ring && <div className="pointer-events-none absolute inset-0 z-[5]" style={ring} />}
                 {selectedBy && selectedBy.length > 0 && (
                     <div className="absolute right-1 bottom-full z-10 flex translate-y-2 flex-row items-center gap-px">
                         {selectedBy.slice(0, 2).map((person) => (
@@ -200,11 +238,17 @@ const ValueCell = ({
                     <input
                         value={draft ?? display}
                         onFocus={() => {
-                            setDraft(value === null ? "" : String(value));
+                            /* Re-focus after a window switch must not clobber an
+                               in-progress draft the blur guard preserved. */
+                            if (draft === null) setDraft(value === null ? "" : String(value));
                             onSelectChange?.(true);
                         }}
                         onChange={(e) => setDraft(e.target.value)}
                         onBlur={() => {
+                            /* A blur caused by the window losing focus (the user glanced at
+                               another window or monitor) doesn't end the editing session —
+                               keep the selection visible to everyone and the draft intact. */
+                            if (!document.hasFocus()) return;
                             onSelectChange?.(false);
                             if (draft !== null) {
                                 const cleaned = draft.replace(/[,$\s]/g, "").replace(/^\((.*)\)$/, "-$1");
@@ -286,10 +330,12 @@ export const ReportBuilder = () => {
     const [scanRowId, setScanRowId] = useState<string | null>(null);
     const [selections, setSelections] = useState<SelectionMap>({});
     const gridRef = useRef<HTMLDivElement>(null);
-    /* Cursor animation state lives outside React: targets come from presence messages,
-       a rAF loop eases the visible position toward them every frame. */
+    /* Cursor animation state lives outside React. Real peers use a jitter buffer:
+       arriving positions are timestamped and the cursor replays the actual path a
+       fixed beat behind, interpolating between samples — bursty broker delivery
+       still renders as one continuous, smooth motion. */
     const cursorEls = useRef<Map<string, HTMLDivElement>>(new Map());
-    const cursorMotion = useRef<Record<string, { tx: number; ty: number; x: number; y: number; sim: boolean }>>({});
+    const cursorMotion = useRef<Record<string, CursorMotion>>({});
 
     /* Real-time presence: live cursors from anyone else on this page.
        Cursor packets arrive at network rate and are written straight into the
@@ -324,19 +370,56 @@ export const ReportBuilder = () => {
     const onCursor = useCallback(
         (event: CursorEvent) => {
             peerCursorsRef.current[event.peer.id] = event;
+            const newest = event.points[event.points.length - 1];
 
-            /* Fast path: update the animation target directly — no React involved. */
+            /* Fast path: unpack the timestamped trail into the jitter buffer — no
+               React involved. Sender timestamps preserve the temporal shape of the
+               motion; we map them onto our clock via the fastest observed delivery
+               (window min) and size the replay delay to the observed spread. */
             const { doc: currentDoc, stmtId: currentStmt } = docStmtRef.current;
-            if (event.cursor.doc === currentDoc && event.cursor.stmtId === currentStmt) {
-                const pos = computeCellPos(event.cursor.cell, event.cursor.fx, event.cursor.fy);
-                if (pos) {
-                    const motion = cursorMotion.current[event.peer.id];
-                    if (motion) {
-                        motion.tx = pos.x;
-                        motion.ty = pos.y;
-                    } else {
-                        cursorMotion.current[event.peer.id] = { tx: pos.x, ty: pos.y, x: pos.x, y: pos.y, sim: false };
+            if (event.doc === currentDoc && event.stmtId === currentStmt) {
+                const now = performance.now();
+                let motion = cursorMotion.current[event.peer.id];
+
+                for (const point of event.points) {
+                    /* The topic is public — never let a malformed point NaN-poison the
+                       latency window or the rendered transform. */
+                    if (typeof point?.cell !== "string" || !Number.isFinite(point.fx) || !Number.isFinite(point.fy) || !Number.isFinite(point.ts)) {
+                        continue;
                     }
+                    const pos = computeCellPos(point.cell, point.fx, point.fy);
+                    if (!pos) continue;
+
+                    if (!motion) {
+                        motion = {
+                            tx: pos.x,
+                            ty: pos.y,
+                            x: pos.x,
+                            y: pos.y,
+                            sim: false,
+                            buffer: [],
+                            latWindow: [],
+                            delay: MIN_DELAY_MS,
+                            targetDelay: MIN_DELAY_MS,
+                            lastRenderT: 0,
+                        };
+                        cursorMotion.current[event.peer.id] = motion;
+                    }
+                    motion.tx = pos.x;
+                    motion.ty = pos.y;
+
+                    const delta = now - point.ts;
+                    motion.latWindow.push(delta);
+                    if (motion.latWindow.length > 120) motion.latWindow.splice(0, motion.latWindow.length - 120);
+                    const base = Math.min(...motion.latWindow);
+                    const spread = Math.max(...motion.latWindow) - base;
+                    motion.targetDelay = Math.min(MAX_DELAY_MS, Math.max(MIN_DELAY_MS, spread + 60));
+
+                    let t = point.ts + base;
+                    const lastSample = motion.buffer[motion.buffer.length - 1];
+                    if (lastSample && t <= lastSample.t) t = lastSample.t + 1;
+                    motion.buffer.push({ x: pos.x, y: pos.y, t });
+                    if (motion.buffer.length > 120) motion.buffer.splice(0, motion.buffer.length - 120);
                 }
             }
 
@@ -345,11 +428,11 @@ export const ReportBuilder = () => {
                 const existing = prev[event.peer.id];
                 if (
                     existing &&
-                    existing.cellKey === event.cursor.cell &&
+                    existing.cellKey === newest.cell &&
                     existing.name === event.peer.name &&
                     existing.color === event.peer.color &&
-                    existing.doc === event.cursor.doc &&
-                    existing.stmtId === event.cursor.stmtId
+                    existing.doc === event.doc &&
+                    existing.stmtId === event.stmtId
                 ) {
                     return prev;
                 }
@@ -359,9 +442,9 @@ export const ReportBuilder = () => {
                         id: event.peer.id,
                         name: event.peer.name,
                         color: event.peer.color,
-                        cellKey: event.cursor.cell,
-                        doc: event.cursor.doc,
-                        stmtId: event.cursor.stmtId,
+                        cellKey: newest.cell,
+                        doc: event.doc,
+                        stmtId: event.stmtId,
                     },
                 };
             });
@@ -467,11 +550,12 @@ export const ReportBuilder = () => {
         for (const pc of Object.values(peerCells)) {
             if (pc.doc === doc && pc.stmtId === statement.id) {
                 const lastEvent = peerCursorsRef.current[pc.id];
+                const newest = lastEvent?.points[lastEvent.points.length - 1];
                 targets.push({
                     person: { id: pc.id, name: pc.name, color: pc.color },
                     cellKey: pc.cellKey,
-                    fx: lastEvent?.cursor.fx ?? 0.5,
-                    fy: lastEvent?.cursor.fy ?? 0.5,
+                    fx: newest?.fx ?? 0.5,
+                    fy: newest?.fy ?? 0.5,
                 });
             }
         }
@@ -508,7 +592,18 @@ export const ReportBuilder = () => {
             const motion = cursorMotion.current[id];
             if (!motion) {
                 /* New cursor: appear in place rather than flying in from offscreen. */
-                cursorMotion.current[id] = { tx: x, ty: y, x, y, sim: !!target.sim };
+                cursorMotion.current[id] = {
+                    tx: x,
+                    ty: y,
+                    x,
+                    y,
+                    sim: !!target.sim,
+                    buffer: [],
+                    latWindow: [],
+                    delay: MIN_DELAY_MS,
+                    targetDelay: MIN_DELAY_MS,
+                    lastRenderT: 0,
+                };
                 cursorEls.current.get(id)?.style.setProperty("transform", `translate(${x}px, ${y}px)`);
             } else {
                 motion.tx = x;
@@ -527,9 +622,11 @@ export const ReportBuilder = () => {
         return () => window.removeEventListener("resize", updateCursorTargets);
     }, [updateCursorTargets]);
 
-    /* 60fps easing loop with time-based exponential smoothing: real cursors track
-       tightly (~70ms time constant — hides network burst jitter without visible lag),
-       sims drift lazily. Frame-rate independent. */
+    /* 60fps animation loop. Real cursors replay their jitter-buffered path
+       INTERP_DELAY_MS behind arrival, linearly interpolating between samples —
+       motion is smooth by construction regardless of network burstiness. When the
+       buffer runs dry (sender paused), ease onto the final position. Sims drift
+       with lazy exponential easing. Frame-rate independent. */
     useEffect(() => {
         let raf = 0;
         let last = performance.now();
@@ -539,10 +636,42 @@ export const ReportBuilder = () => {
             for (const [id, motion] of Object.entries(cursorMotion.current)) {
                 const el = cursorEls.current.get(id);
                 if (!el) continue;
-                const tau = motion.sim ? 420 : 70;
-                const k = 1 - Math.exp(-dt / tau);
-                motion.x += (motion.tx - motion.x) * k;
-                motion.y += (motion.ty - motion.y) * k;
+
+                if (motion.sim) {
+                    const k = 1 - Math.exp(-dt / 420);
+                    motion.x += (motion.tx - motion.x) * k;
+                    motion.y += (motion.ty - motion.y) * k;
+                } else {
+                    /* Adapt the replay delay to measured jitter: grow quickly when the
+                       network turns bursty (prevents stalls), shrink slowly when it
+                       calms (keeps the timeline steady). */
+                    const delayTau = motion.targetDelay > motion.delay ? 150 : 2500;
+                    motion.delay += (motion.targetDelay - motion.delay) * (1 - Math.exp(-dt / delayTau));
+                    /* Growing delay must pause the replay, never run it backward —
+                       a reversing timeline reads as rubber-banding. */
+                    const renderTime = Math.max(now - motion.delay, motion.lastRenderT);
+                    motion.lastRenderT = renderTime;
+                    const buffer = motion.buffer;
+                    /* Drop samples that are already behind the render time, keeping
+                       one on each side of it for interpolation. */
+                    while (buffer.length >= 2 && buffer[1].t <= renderTime) buffer.shift();
+
+                    if (buffer.length >= 2 && buffer[0].t <= renderTime) {
+                        const a = buffer[0];
+                        const b = buffer[1];
+                        const f = (renderTime - a.t) / Math.max(1, b.t - a.t);
+                        motion.x = a.x + (b.x - a.x) * f;
+                        motion.y = a.y + (b.y - a.y) * f;
+                    } else {
+                        /* No bracket: ease toward the NEXT sample on the path (or the
+                           resting target when the buffer is empty) — never the newest,
+                           which would zip ahead and snap back when replay resumes. */
+                        const target = buffer.length > 0 ? buffer[0] : { x: motion.tx, y: motion.ty };
+                        const k = 1 - Math.exp(-dt / 90);
+                        motion.x += (target.x - motion.x) * k;
+                        motion.y += (target.y - motion.y) * k;
+                    }
+                }
                 el.style.transform = `translate(${motion.x}px, ${motion.y}px)`;
             }
             raf = requestAnimationFrame(tick);

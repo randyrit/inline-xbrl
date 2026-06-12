@@ -14,12 +14,20 @@ import type { Identity } from "@/lib/identity";
 const BROKER_URL = "wss://broker.emqx.io:8084/mqtt";
 
 const room = new URLSearchParams(window.location.search).get("room") ?? "main";
-const TOPIC = `inline-xbrl-demo/${room}/v2`;
+const TOPIC = `inline-xbrl-demo/${room}/v3`;
 
 const HEARTBEAT_MS = 4000;
-const PEER_TIMEOUT_MS = 12000;
-/* ~40 updates/sec — receivers interpolate between them, so motion reads as realtime. */
-const CURSOR_THROTTLE_MS = 25;
+/* Generous: Chrome throttles hidden-tab timers down to ~1/min, and reaping someone
+   who merely switched windows would wipe their cursor and selection for everyone.
+   Dead connections are cleaned up promptly by the MQTT Last-Will instead. */
+const PEER_TIMEOUT_MS = 70000;
+/* Cursor positions are sampled every SAMPLE_MS but shipped as batched trails every
+   FLUSH_MS — the public broker rate-limits (and drops) rapid individual publishes,
+   while ~10 packets/sec sails through. Receivers replay the timestamped trail, so
+   path fidelity stays at full sampling rate. */
+const CURSOR_SAMPLE_MS = 25;
+const CURSOR_FLUSH_MS = 100;
+const TRAIL_MAX_POINTS = 6;
 
 export interface PeerCursor {
     stmtId: string;
@@ -30,6 +38,15 @@ export interface PeerCursor {
     /** Fractional position inside the cell, so layout differences don't matter. */
     fx: number;
     fy: number;
+}
+
+/** One timestamped point of a cursor trail. */
+export interface TrailPoint {
+    cell: string;
+    fx: number;
+    fy: number;
+    /** Sender-side performance.now() — preserves the temporal shape of the motion. */
+    ts: number;
 }
 
 export interface Peer {
@@ -49,7 +66,10 @@ export interface RemoteEdit {
 
 export interface CursorEvent {
     peer: Peer;
-    cursor: PeerCursor;
+    doc: string;
+    stmtId: string;
+    /** The batched trail, oldest point first. */
+    points: TrailPoint[];
 }
 
 /** A cell someone is actively working in (clicked/focused) — null clears it. */
@@ -67,7 +87,7 @@ export interface SelectEvent {
 type WireMessage =
     | { t: "hello"; id: string; name: string; color: string; acct: boolean }
     | { t: "bye"; id: string }
-    | ({ t: "cur"; id: string; name: string; color: string; acct: boolean } & PeerCursor)
+    | { t: "cur"; id: string; name: string; color: string; acct: boolean; doc: string; stmtId: string; pts: TrailPoint[] }
     | { t: "sel"; id: string; name: string; color: string; acct: boolean; sel: PeerSelection | null }
     | { t: "edit"; id: string; doc: string; stmtId: string; rowId: string; col: number; value: number | null };
 
@@ -90,8 +110,12 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
     const handlersRef = useRef(handlers);
     handlersRef.current = handlers;
     const lastSeenRef = useRef<Record<string, number>>({});
-    const lastCursorSent = useRef(0);
-    const pendingCursor = useRef<PeerCursor | null>(null);
+    const lastCursorSampled = useRef(0);
+    const trail = useRef<TrailPoint[]>([]);
+    const trailContext = useRef<{ doc: string; stmtId: string } | null>(null);
+    /* Position throttled away between samples — appended at flush so the cursor's
+       final resting point is always exact. */
+    const pendingPoint = useRef<TrailPoint | null>(null);
     const flushTimer = useRef<number | null>(null);
     const mySelection = useRef<PeerSelection | null>(null);
 
@@ -105,10 +129,10 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
     const hello = useCallback(() => {
         const me = identityRef.current;
         publish({ t: "hello", id: me.id, name: me.name, color: me.color, acct: me.isAccount });
-        /* Late joiners need to learn about an already-active selection. */
-        if (mySelection.current) {
-            publish({ t: "sel", id: me.id, name: me.name, color: me.color, acct: me.isAccount, sel: mySelection.current });
-        }
+        /* Replay the full selection state (including "none") every heartbeat: late
+           joiners learn about active selections, and a receiver that missed a clear
+           self-heals instead of showing a stuck ring. */
+        publish({ t: "sel", id: me.id, name: me.name, color: me.color, acct: me.isAccount, sel: mySelection.current });
     }, [publish]);
 
     const removePeer = useCallback((id: string) => {
@@ -129,12 +153,22 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
             keepalive: 30,
             reconnectPeriod: 3000,
             connectTimeout: 8000,
+            /* Last-Will: if the connection dies (closed laptop, killed tab), the broker
+               broadcasts our departure so peers don't stare at a ghost cursor. */
+            will: {
+                topic: TOPIC,
+                payload: JSON.stringify({ t: "bye", id: identityRef.current.id }),
+                qos: 1,
+                retain: false,
+            },
         });
         clientRef.current = client;
 
         client.on("connect", () => {
             setConnected(true);
-            client.subscribe(TOPIC);
+            /* qos 1 on the subscription too — publisher qos is capped by it, and
+               selection/edit messages rely on at-least-once delivery. */
+            client.subscribe(TOPIC, { qos: 1 });
             hello();
         });
         client.on("close", () => setConnected(false));
@@ -176,7 +210,9 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
             });
 
             if (msg.t === "cur") {
-                handlersRef.current.onCursor({ peer, cursor: { stmtId: msg.stmtId, doc: msg.doc, cell: msg.cell, fx: msg.fx, fy: msg.fy } });
+                if (Array.isArray(msg.pts) && msg.pts.length > 0) {
+                    handlersRef.current.onCursor({ peer, doc: msg.doc, stmtId: msg.stmtId, points: msg.pts });
+                }
             } else if (msg.t === "sel") {
                 handlersRef.current.onSelect({ peer, selection: msg.sel });
             }
@@ -193,10 +229,20 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
         const bye = () => publish({ t: "bye", id: identityRef.current.id });
         window.addEventListener("beforeunload", bye);
 
+        /* Coming back from a background tab or another window: re-announce right
+           away (heartbeats may have been throttled while hidden). */
+        const reannounce = () => {
+            if (!document.hidden) hello();
+        };
+        document.addEventListener("visibilitychange", reannounce);
+        window.addEventListener("focus", reannounce);
+
         return () => {
             window.clearInterval(heartbeat);
             window.clearInterval(reaper);
             window.removeEventListener("beforeunload", bye);
+            document.removeEventListener("visibilitychange", reannounce);
+            window.removeEventListener("focus", reannounce);
             if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
             bye();
             client.end(true);
@@ -210,32 +256,61 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
         hello();
     }, [identity.name, identity.color, identity.isAccount, hello]);
 
+    const flushTrail = useCallback(() => {
+        if (flushTimer.current !== null) {
+            window.clearTimeout(flushTimer.current);
+            flushTimer.current = null;
+        }
+        if (pendingPoint.current) {
+            trail.current.push(pendingPoint.current);
+            pendingPoint.current = null;
+        }
+        const context = trailContext.current;
+        if (!context || trail.current.length === 0) return;
+        const me = identityRef.current;
+        publish({
+            t: "cur",
+            id: me.id,
+            name: me.name,
+            color: me.color,
+            acct: me.isAccount,
+            doc: context.doc,
+            stmtId: context.stmtId,
+            pts: trail.current,
+        });
+        trail.current = [];
+    }, [publish]);
+
+    /** Sample the cursor into the current trail; trails ship every CURSOR_FLUSH_MS. */
     const sendCursor = useCallback(
         (cursor: PeerCursor) => {
-            const sendNow = (c: PeerCursor) => {
-                lastCursorSent.current = Date.now();
-                const me = identityRef.current;
-                publish({ t: "cur", id: me.id, name: me.name, color: me.color, acct: me.isAccount, ...c });
-            };
-
-            const elapsed = Date.now() - lastCursorSent.current;
-            if (elapsed >= CURSOR_THROTTLE_MS) {
-                sendNow(cursor);
+            const now = performance.now();
+            if (now - lastCursorSampled.current < CURSOR_SAMPLE_MS) {
+                /* Keep the freshest throttled-away point for the flush. */
+                pendingPoint.current = { cell: cursor.cell, fx: cursor.fx, fy: cursor.fy, ts: Math.round(now) };
                 return;
             }
-            /* Trailing flush: the final resting position always goes out. */
-            pendingCursor.current = cursor;
+            lastCursorSampled.current = now;
+            pendingPoint.current = null;
+
+            /* Statement switched mid-trail: ship what we have, start fresh. */
+            const context = trailContext.current;
+            if (context && (context.doc !== cursor.doc || context.stmtId !== cursor.stmtId)) flushTrail();
+            trailContext.current = { doc: cursor.doc, stmtId: cursor.stmtId };
+
+            trail.current.push({ cell: cursor.cell, fx: cursor.fx, fy: cursor.fy, ts: Math.round(now) });
+            if (trail.current.length >= TRAIL_MAX_POINTS) {
+                flushTrail();
+                return;
+            }
             if (flushTimer.current === null) {
                 flushTimer.current = window.setTimeout(() => {
                     flushTimer.current = null;
-                    if (pendingCursor.current) {
-                        sendNow(pendingCursor.current);
-                        pendingCursor.current = null;
-                    }
-                }, CURSOR_THROTTLE_MS - elapsed);
+                    flushTrail();
+                }, CURSOR_FLUSH_MS);
             }
         },
-        [publish],
+        [flushTrail],
     );
 
     const sendEdit = useCallback(
