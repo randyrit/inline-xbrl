@@ -1,15 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import mqtt from "mqtt";
+import { Peer as PeerJsClient } from "peerjs";
+import type { DataConnection } from "peerjs";
 import type { Identity } from "@/lib/identity";
 
 /**
- * Real-time presence over MQTT-over-WebSockets, using a public broker so the
- * demo needs no backend or API keys. Everyone on the same room topic sees each
- * other's cursors live. Messages are unauthenticated and public — demo data only.
+ * Real-time presence with a two-tier transport, no backend or API keys:
  *
- * Performance: cursor packets bypass React state entirely — they stream to the
- * `onCursor` callback so the consumer can drive animations imperatively. React
- * state (`peers`) changes only when someone joins, leaves, or renames.
+ * 1. MQTT over WebSockets (public broker) — roster, selections, edits, and
+ *    cursor-trail fallback. Reliable but rate-limited.
+ * 2. WebRTC data channels via PeerJS Cloud (free public brokering API) — raw
+ *    mouse input streamed peer-to-peer at event rate (~60–120Hz, unordered,
+ *    no retransmits). This is what makes remote cursors feel Figma-live.
+ *    Peers discover each other's PeerJS ids through MQTT hellos; if a P2P
+ *    connection can't form (strict NAT), the MQTT trail fallback covers it.
+ *
+ * Cursor packets bypass React state entirely — they stream to the `onCursor`
+ * callback so the consumer can drive animations imperatively. React state
+ * (`peers`) changes only when someone joins, leaves, or renames.
  */
 const BROKER_URL = "wss://broker.emqx.io:8084/mqtt";
 
@@ -28,6 +36,8 @@ const PEER_TIMEOUT_MS = 70000;
 const CURSOR_SAMPLE_MS = 25;
 const CURSOR_FLUSH_MS = 100;
 const TRAIL_MAX_POINTS = 6;
+/* P2P mouse stream cap (~120Hz). */
+const P2P_SEND_MIN_MS = 8;
 
 export interface PeerCursor {
     stmtId: string;
@@ -85,7 +95,7 @@ export interface SelectEvent {
 }
 
 type WireMessage =
-    | { t: "hello"; id: string; name: string; color: string; acct: boolean }
+    | { t: "hello"; id: string; name: string; color: string; acct: boolean; pj?: string }
     | { t: "bye"; id: string }
     | { t: "cur"; id: string; name: string; color: string; acct: boolean; doc: string; stmtId: string; pts: TrailPoint[] }
     | { t: "sel"; id: string; name: string; color: string; acct: boolean; sel: PeerSelection | null }
@@ -110,6 +120,15 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
     const handlersRef = useRef(handlers);
     handlersRef.current = handlers;
     const lastSeenRef = useRef<Record<string, number>>({});
+    /* Mirror of `peers` readable from network callbacks without re-subscribing. */
+    const peersRef = useRef<Record<string, Peer>>({});
+    /* WebRTC mouse-stream plumbing. */
+    const peerJsRef = useRef<PeerJsClient | null>(null);
+    const peerJsId = useRef(`inx-${Math.random().toString(36).slice(2, 12)}`);
+    const channelsRef = useRef<Map<string, DataConnection>>(new Map());
+    const p2pInboundRef = useRef<Map<string, number>>(new Map());
+    const lastP2pSent = useRef(0);
+    const p2pTailTimer = useRef<number | null>(null);
     const lastCursorSampled = useRef(0);
     const trail = useRef<TrailPoint[]>([]);
     const trailContext = useRef<{ doc: string; stmtId: string } | null>(null);
@@ -126,9 +145,72 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
         if (client?.connected) client.publish(TOPIC, JSON.stringify(msg), { qos });
     }, []);
 
+    /* ----- WebRTC mouse-stream channels (PeerJS Cloud) ----- */
+
+    /** Visible in the console (and used by tests): number of live P2P mouse streams. */
+    const updateP2pDebug = useCallback(() => {
+        let open = 0;
+        for (const c of channelsRef.current.values()) if (c.open) open++;
+        (window as unknown as { __inlineP2P?: number }).__inlineP2P = open;
+    }, []);
+
+    const attachChannel = useCallback((remoteId: string, conn: DataConnection) => {
+        const existing = channelsRef.current.get(remoteId);
+        if (existing && existing.open) {
+            conn.close();
+            return;
+        }
+        existing?.close();
+        channelsRef.current.set(remoteId, conn);
+        conn.on("open", updateP2pDebug);
+
+        conn.on("data", (raw) => {
+            const d = raw as { cell?: unknown; fx?: unknown; fy?: unknown; ts?: unknown; doc?: unknown; stmtId?: unknown };
+            if (typeof d?.cell !== "string" || typeof d.doc !== "string" || typeof d.stmtId !== "string") return;
+            if (!Number.isFinite(d.fx) || !Number.isFinite(d.fy) || !Number.isFinite(d.ts)) return;
+            p2pInboundRef.current.set(remoteId, Date.now());
+            const peerInfo = peersRef.current[remoteId];
+            if (!peerInfo) return; // roster catches up via the next hello
+            handlersRef.current.onCursor({
+                peer: peerInfo,
+                doc: d.doc,
+                stmtId: d.stmtId,
+                points: [{ cell: d.cell, fx: d.fx as number, fy: d.fy as number, ts: d.ts as number }],
+            });
+        });
+        const drop = () => {
+            if (channelsRef.current.get(remoteId) === conn) channelsRef.current.delete(remoteId);
+            updateP2pDebug();
+        };
+        conn.on("close", drop);
+        conn.on("error", drop);
+    }, [updateP2pDebug]);
+
+    /** The lexicographically smaller identity initiates, so both sides don't dial at once. */
+    const maybeDial = useCallback(
+        (remoteId: string, remotePjId: string) => {
+            const peer = peerJsRef.current;
+            if (!peer || peer.destroyed || !peer.open) return;
+            if (identityRef.current.id >= remoteId) return;
+            const existing = channelsRef.current.get(remoteId);
+            if (existing && (existing.open || existing.peer === remotePjId)) return;
+            try {
+                const conn = peer.connect(remotePjId, {
+                    reliable: false, // unordered, no retransmits — lowest latency; drops are fine for cursors
+                    serialization: "json",
+                    metadata: { id: identityRef.current.id },
+                });
+                attachChannel(remoteId, conn);
+            } catch {
+                /* P2P is best-effort; the MQTT trail fallback covers this peer. */
+            }
+        },
+        [attachChannel],
+    );
+
     const hello = useCallback(() => {
         const me = identityRef.current;
-        publish({ t: "hello", id: me.id, name: me.name, color: me.color, acct: me.isAccount });
+        publish({ t: "hello", id: me.id, name: me.name, color: me.color, acct: me.isAccount, pj: peerJsId.current });
         /* Replay the full selection state (including "none") every heartbeat: late
            joiners learn about active selections, and a receiver that missed a clear
            self-heals instead of showing a stuck ring. */
@@ -137,10 +219,14 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
 
     const removePeer = useCallback((id: string) => {
         delete lastSeenRef.current[id];
+        channelsRef.current.get(id)?.close();
+        channelsRef.current.delete(id);
+        p2pInboundRef.current.delete(id);
         setPeers((prev) => {
             if (!(id in prev)) return prev;
             const next = { ...prev };
             delete next[id];
+            peersRef.current = next;
             return next;
         });
         handlersRef.current.onLeave?.(id);
@@ -163,6 +249,22 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
             },
         });
         clientRef.current = client;
+
+        /* PeerJS Cloud client for direct mouse-stream channels. */
+        const pjs = new PeerJsClient(peerJsId.current, { debug: 0 });
+        peerJsRef.current = pjs;
+        pjs.on("open", () => {
+            /* Announce again now that we're dialable. */
+            hello();
+        });
+        pjs.on("connection", (conn) => {
+            const remoteId = (conn.metadata as { id?: unknown } | undefined)?.id;
+            if (typeof remoteId === "string") attachChannel(remoteId, conn);
+            else conn.close();
+        });
+        pjs.on("error", () => {
+            /* Best-effort: peers without a P2P path fall back to MQTT trails. */
+        });
 
         client.on("connect", () => {
             setConnected(true);
@@ -206,10 +308,18 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
                 }
                 // Announce ourselves to newcomers so they get the roster instantly.
                 if (!existing) hello();
-                return { ...prev, [msg.id]: peer };
+                const next = { ...prev, [msg.id]: peer };
+                peersRef.current = next;
+                return next;
             });
 
+            if (msg.t === "hello" && typeof msg.pj === "string") {
+                maybeDial(msg.id, msg.pj);
+            }
+
             if (msg.t === "cur") {
+                /* A live P2P stream supersedes the MQTT trail for this peer. */
+                if (Date.now() - (p2pInboundRef.current.get(msg.id) ?? 0) < 2000) return;
                 if (Array.isArray(msg.pts) && msg.pts.length > 0) {
                     handlersRef.current.onCursor({ peer, doc: msg.doc, stmtId: msg.stmtId, points: msg.pts });
                 }
@@ -247,6 +357,10 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
             bye();
             client.end(true);
             clientRef.current = null;
+            pjs.destroy();
+            peerJsRef.current = null;
+            channelsRef.current.clear();
+            p2pInboundRef.current.clear();
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
@@ -281,10 +395,50 @@ export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
         trail.current = [];
     }, [publish]);
 
-    /** Sample the cursor into the current trail; trails ship every CURSOR_FLUSH_MS. */
+    /** Stream the cursor: P2P at near-event rate to every open channel, with the
+        MQTT trail as fallback for peers we couldn't reach directly. */
     const sendCursor = useCallback(
         (cursor: PeerCursor) => {
             const now = performance.now();
+
+            /* P2P fast path. */
+            if (now - lastP2pSent.current >= P2P_SEND_MIN_MS) {
+                let sentAny = false;
+                for (const conn of channelsRef.current.values()) {
+                    if (conn.open) {
+                        try {
+                            conn.send({ ...cursor, ts: Math.round(now) });
+                            sentAny = true;
+                        } catch {
+                            /* channel died mid-send; close handler cleans up */
+                        }
+                    }
+                }
+                if (sentAny) {
+                    lastP2pSent.current = now;
+                    /* The channel is unordered/no-retransmit: repeat the final resting
+                       position once so a dropped last packet can't strand the cursor. */
+                    if (p2pTailTimer.current !== null) window.clearTimeout(p2pTailTimer.current);
+                    p2pTailTimer.current = window.setTimeout(() => {
+                        p2pTailTimer.current = null;
+                        for (const conn of channelsRef.current.values()) {
+                            if (conn.open) {
+                                try {
+                                    conn.send({ ...cursor, ts: Math.round(performance.now()) });
+                                } catch {
+                                    /* best-effort */
+                                }
+                            }
+                        }
+                    }, 160);
+                }
+            }
+
+            /* Skip the MQTT trail only when every known peer has a live channel. */
+            const roster = Object.keys(peersRef.current);
+            const allCovered = roster.length > 0 && roster.every((id) => channelsRef.current.get(id)?.open);
+            if (allCovered) return;
+
             if (now - lastCursorSampled.current < CURSOR_SAMPLE_MS) {
                 /* Keep the freshest throttled-away point for the flush. */
                 pendingPoint.current = { cell: cursor.cell, fx: cursor.fx, fy: cursor.fy, ts: Math.round(now) };

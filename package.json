@@ -20,6 +20,7 @@
         "input-otp": "^1.4.2",
         "motion": "^12.38.0",
         "mqtt": "^5.15.1",
+        "peerjs": "^1.5.5",
         "qr-code-styling": "^1.9.2",
         "react": "^19.2.4",
         "react-aria": "^3.47.0",

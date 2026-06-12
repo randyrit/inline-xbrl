@@ -59,8 +59,10 @@ interface CursorMotion {
     lastRenderT: number;
 }
 
-/* Replay delay bounds: enough to bridge broker jitter, small enough to feel live. */
-const MIN_DELAY_MS = 110;
+/* Replay delay bounds. P2P mouse streams have tiny jitter, so the floor sits low
+   (Figma-feel); the adaptive target grows automatically for the bursty MQTT
+   fallback path. */
+const MIN_DELAY_MS = 60;
 const MAX_DELAY_MS = 600;
 
 /** Where a person's cursor should render: a cell anchor key plus a fractional offset inside it. */
