@@ -48,17 +48,29 @@ export const generateAnonymousIdentity = (): Identity => {
 
 const STORAGE_KEY = "inline-identity-v1";
 
-/** Identity persists for the browser session — every new visitor gets a fresh random name. */
+/* Cached for the lifetime of the page load, so repeated calls (e.g. React
+   StrictMode double-init) agree on one identity. */
+let sessionIdentity: Identity | null = null;
+
+/** Signed-in users keep their account across reloads; anonymous visitors get a
+    freshly randomized name every time they come to the page. */
 export const loadIdentity = (): Identity => {
+    if (sessionIdentity) return sessionIdentity;
     try {
         const raw = sessionStorage.getItem(STORAGE_KEY);
-        if (raw) return JSON.parse(raw) as Identity;
+        if (raw) {
+            const stored = JSON.parse(raw) as Identity;
+            if (stored.isAccount) {
+                sessionIdentity = stored;
+                return stored;
+            }
+        }
     } catch {
         // fall through to a fresh identity
     }
-    const identity = generateAnonymousIdentity();
-    saveIdentity(identity);
-    return identity;
+    sessionIdentity = generateAnonymousIdentity();
+    saveIdentity(sessionIdentity);
+    return sessionIdentity;
 };
 
 export const saveIdentity = (identity: Identity): void => {

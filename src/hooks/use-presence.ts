@@ -6,22 +6,27 @@ import type { Identity } from "@/lib/identity";
  * Real-time presence over MQTT-over-WebSockets, using a public broker so the
  * demo needs no backend or API keys. Everyone on the same room topic sees each
  * other's cursors live. Messages are unauthenticated and public — demo data only.
+ *
+ * Performance: cursor packets bypass React state entirely — they stream to the
+ * `onCursor` callback so the consumer can drive animations imperatively. React
+ * state (`peers`) changes only when someone joins, leaves, or renames.
  */
 const BROKER_URL = "wss://broker.emqx.io:8084/mqtt";
 
 const room = new URLSearchParams(window.location.search).get("room") ?? "main";
-const TOPIC = `inline-xbrl-demo/${room}/v1`;
+const TOPIC = `inline-xbrl-demo/${room}/v2`;
 
 const HEARTBEAT_MS = 4000;
 const PEER_TIMEOUT_MS = 12000;
-/* ~30 updates/sec — receivers interpolate between them, so motion reads as realtime. */
-const CURSOR_THROTTLE_MS = 35;
+/* ~40 updates/sec — receivers interpolate between them, so motion reads as realtime. */
+const CURSOR_THROTTLE_MS = 25;
 
 export interface PeerCursor {
     stmtId: string;
     doc: string;
-    rowId: string;
-    col: number;
+    /** The data-cell anchor key under the pointer — any cell in the grid,
+        e.g. "bs-cash:0", "bs-cash:label", "head:1". */
+    cell: string;
     /** Fractional position inside the cell, so layout differences don't matter. */
     fx: number;
     fy: number;
@@ -32,15 +37,7 @@ export interface Peer {
     name: string;
     color: string;
     isAccount: boolean;
-    cursor: PeerCursor | null;
-    lastSeen: number;
 }
-
-type WireMessage =
-    | { t: "hello"; id: string; name: string; color: string; acct: boolean }
-    | { t: "bye"; id: string }
-    | ({ t: "cur"; id: string; name: string; color: string; acct: boolean } & PeerCursor)
-    | { t: "edit"; id: string; doc: string; stmtId: string; rowId: string; col: number; value: number | null };
 
 export interface RemoteEdit {
     doc: string;
@@ -50,14 +47,34 @@ export interface RemoteEdit {
     value: number | null;
 }
 
-export const usePresence = (identity: Identity, onRemoteEdit: (edit: RemoteEdit) => void) => {
+export interface CursorEvent {
+    peer: Peer;
+    cursor: PeerCursor;
+}
+
+type WireMessage =
+    | { t: "hello"; id: string; name: string; color: string; acct: boolean }
+    | { t: "bye"; id: string }
+    | ({ t: "cur"; id: string; name: string; color: string; acct: boolean } & PeerCursor)
+    | { t: "edit"; id: string; doc: string; stmtId: string; rowId: string; col: number; value: number | null };
+
+export interface PresenceHandlers {
+    onRemoteEdit: (edit: RemoteEdit) => void;
+    /** Fired for every cursor packet — called outside React state, at network rate. */
+    onCursor: (event: CursorEvent) => void;
+    /** Fired when a peer disconnects or times out. */
+    onLeave?: (peerId: string) => void;
+}
+
+export const usePresence = (identity: Identity, handlers: PresenceHandlers) => {
     const [peers, setPeers] = useState<Record<string, Peer>>({});
     const [connected, setConnected] = useState(false);
     const clientRef = useRef<mqtt.MqttClient | null>(null);
     const identityRef = useRef(identity);
     identityRef.current = identity;
-    const onRemoteEditRef = useRef(onRemoteEdit);
-    onRemoteEditRef.current = onRemoteEdit;
+    const handlersRef = useRef(handlers);
+    handlersRef.current = handlers;
+    const lastSeenRef = useRef<Record<string, number>>({});
     const lastCursorSent = useRef(0);
     const pendingCursor = useRef<PeerCursor | null>(null);
     const flushTimer = useRef<number | null>(null);
@@ -71,6 +88,17 @@ export const usePresence = (identity: Identity, onRemoteEdit: (edit: RemoteEdit)
         const me = identityRef.current;
         publish({ t: "hello", id: me.id, name: me.name, color: me.color, acct: me.isAccount });
     }, [publish]);
+
+    const removePeer = useCallback((id: string) => {
+        delete lastSeenRef.current[id];
+        setPeers((prev) => {
+            if (!(id in prev)) return prev;
+            const next = { ...prev };
+            delete next[id];
+            return next;
+        });
+        handlersRef.current.onLeave?.(id);
+    }, []);
 
     useEffect(() => {
         const client = mqtt.connect(BROKER_URL, {
@@ -102,43 +130,40 @@ export const usePresence = (identity: Identity, onRemoteEdit: (edit: RemoteEdit)
             if (msg.id === identityRef.current.id) return; // own echo
 
             if (msg.t === "bye") {
-                setPeers((prev) => {
-                    const next = { ...prev };
-                    delete next[msg.id];
-                    return next;
-                });
+                removePeer(msg.id);
                 return;
             }
+            lastSeenRef.current[msg.id] = Date.now();
+
             if (msg.t === "edit") {
-                onRemoteEditRef.current({ doc: msg.doc, stmtId: msg.stmtId, rowId: msg.rowId, col: msg.col, value: msg.value });
+                handlersRef.current.onRemoteEdit({ doc: msg.doc, stmtId: msg.stmtId, rowId: msg.rowId, col: msg.col, value: msg.value });
                 return;
             }
 
+            /* hello | cur: keep the roster in sync, but only re-render React when
+               someone new joins or an identity actually changes. */
+            const peer: Peer = { id: msg.id, name: msg.name, color: msg.color, isAccount: msg.acct };
             setPeers((prev) => {
                 const existing = prev[msg.id];
+                if (existing && existing.name === peer.name && existing.color === peer.color && existing.isAccount === peer.isAccount) {
+                    return prev;
+                }
                 // Announce ourselves to newcomers so they get the roster instantly.
                 if (!existing) hello();
-                return {
-                    ...prev,
-                    [msg.id]: {
-                        id: msg.id,
-                        name: msg.name,
-                        color: msg.color,
-                        isAccount: msg.acct,
-                        cursor: msg.t === "cur" ? { stmtId: msg.stmtId, doc: msg.doc, rowId: msg.rowId, col: msg.col, fx: msg.fx, fy: msg.fy } : (existing?.cursor ?? null),
-                        lastSeen: Date.now(),
-                    },
-                };
+                return { ...prev, [msg.id]: peer };
             });
+
+            if (msg.t === "cur") {
+                handlersRef.current.onCursor({ peer, cursor: { stmtId: msg.stmtId, doc: msg.doc, cell: msg.cell, fx: msg.fx, fy: msg.fy } });
+            }
         });
 
         const heartbeat = window.setInterval(hello, HEARTBEAT_MS);
         const reaper = window.setInterval(() => {
-            setPeers((prev) => {
-                const now = Date.now();
-                const alive = Object.entries(prev).filter(([, p]) => now - p.lastSeen < PEER_TIMEOUT_MS);
-                return alive.length === Object.keys(prev).length ? prev : Object.fromEntries(alive);
-            });
+            const now = Date.now();
+            for (const [id, seen] of Object.entries(lastSeenRef.current)) {
+                if (now - seen > PEER_TIMEOUT_MS) removePeer(id);
+            }
         }, 3000);
 
         const bye = () => publish({ t: "bye", id: identityRef.current.id });
@@ -148,6 +173,7 @@ export const usePresence = (identity: Identity, onRemoteEdit: (edit: RemoteEdit)
             window.clearInterval(heartbeat);
             window.clearInterval(reaper);
             window.removeEventListener("beforeunload", bye);
+            if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
             bye();
             client.end(true);
             clientRef.current = null;
@@ -186,13 +212,6 @@ export const usePresence = (identity: Identity, onRemoteEdit: (edit: RemoteEdit)
             }
         },
         [publish],
-    );
-
-    useEffect(
-        () => () => {
-            if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
-        },
-        [],
     );
 
     const sendEdit = useCallback(

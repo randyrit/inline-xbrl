@@ -7,7 +7,7 @@ import { Button } from "@/components/base/buttons/button";
 import { Tab, TabList, Tabs } from "@/components/application/tabs/tabs";
 import { Tooltip, TooltipTrigger } from "@/components/base/tooltip/tooltip";
 import { usePresence } from "@/hooks/use-presence";
-import type { RemoteEdit } from "@/hooks/use-presence";
+import type { CursorEvent, RemoteEdit } from "@/hooks/use-presence";
 import { COLLABORATORS, CURRENT_USER } from "@/lib/initial-data";
 import type { DocType, Statement, StatementRow } from "@/lib/types";
 import { COMPANY, DOC_META, autoTag, conceptShortName, formatAccounting, isBalanced, resolveValue, tagStats } from "@/lib/xbrl";
@@ -33,11 +33,11 @@ interface CellRef {
 
 type SelectionMap = Record<string, CellRef>;
 
-/** Where a person's cursor should render: a cell plus a fractional offset inside it. */
+/** Where a person's cursor should render: a cell anchor key plus a fractional offset inside it. */
 interface CursorTarget {
     person: PresencePerson;
-    rowId: string;
-    col: number;
+    /** data-cell key, e.g. "bs-cash:0" (value), "bs-cash:label", "head:1". */
+    cellKey: string;
     fx: number;
     fy: number;
     /** True for the simulated solo-mode teammates. */
@@ -222,10 +222,10 @@ const ValueCell = ({
 };
 
 const TagCell = ({ row, onSuggest, onAccept, scanning }: { row: StatementRow; onSuggest: () => void; onAccept: () => void; scanning: boolean }) => {
-    if (row.kind === "header") return <td />;
+    if (row.kind === "header") return <td data-cell={`${row.id}:tag`} />;
 
     return (
-        <td className="px-3 py-1.5">
+        <td data-cell={`${row.id}:tag`} className="px-3 py-1.5">
             {scanning ? (
                 <span className="inline-flex items-center gap-1.5 rounded-md bg-brand-50 px-2 py-1 font-mono text-xs text-brand-secondary">
                     <Stars01 className="size-3.5 animate-pulse" />
@@ -284,14 +284,96 @@ export const ReportBuilder = () => {
     const cursorEls = useRef<Map<string, HTMLDivElement>>(new Map());
     const cursorMotion = useRef<Record<string, { tx: number; ty: number; x: number; y: number; sim: boolean }>>({});
 
-    /* Real-time presence: live cursors from anyone else on this page. */
+    /* Real-time presence: live cursors from anyone else on this page.
+       Cursor packets arrive at network rate and are written straight into the
+       animation loop (no React re-render); React state updates only when a peer
+       changes cell (for selection rings) or joins/leaves. */
+    const docStmtRef = useRef({ doc, stmtId: statement.id });
+    docStmtRef.current = { doc, stmtId: statement.id };
+
+    const computeCellPos = useCallback((cellKey: string, fx: number, fy: number) => {
+        const grid = gridRef.current;
+        if (!grid) return null;
+        const cell = grid.querySelector(`[data-cell="${cellKey}"]`);
+        if (!cell) return null;
+        const gridRect = grid.getBoundingClientRect();
+        const rect = cell.getBoundingClientRect();
+        return {
+            x: rect.left - gridRect.left + rect.width * fx + grid.scrollLeft,
+            y: rect.top - gridRect.top + rect.height * fy + grid.scrollTop,
+        };
+    }, []);
+
+    const peerCursorsRef = useRef<Record<string, CursorEvent>>({});
+    const [peerCells, setPeerCells] = useState<Record<string, { id: string; name: string; color: string; cellKey: string; doc: string; stmtId: string }>>({});
+
     const onRemoteEdit = useCallback(
         (edit: RemoteEdit) => {
             dispatch({ type: "SET_CELL", doc: edit.doc as DocType, stmtId: edit.stmtId, rowId: edit.rowId, col: edit.col, value: edit.value });
         },
         [dispatch],
     );
-    const { peers, connected, sendCursor, sendEdit, room } = usePresence(identity, onRemoteEdit);
+
+    const onCursor = useCallback(
+        (event: CursorEvent) => {
+            peerCursorsRef.current[event.peer.id] = event;
+
+            /* Fast path: update the animation target directly — no React involved. */
+            const { doc: currentDoc, stmtId: currentStmt } = docStmtRef.current;
+            if (event.cursor.doc === currentDoc && event.cursor.stmtId === currentStmt) {
+                const pos = computeCellPos(event.cursor.cell, event.cursor.fx, event.cursor.fy);
+                if (pos) {
+                    const motion = cursorMotion.current[event.peer.id];
+                    if (motion) {
+                        motion.tx = pos.x;
+                        motion.ty = pos.y;
+                    } else {
+                        cursorMotion.current[event.peer.id] = { tx: pos.x, ty: pos.y, x: pos.x, y: pos.y, sim: false };
+                    }
+                }
+            }
+
+            /* Slow path: re-render only when the hovered CELL (or identity) changes. */
+            setPeerCells((prev) => {
+                const existing = prev[event.peer.id];
+                if (
+                    existing &&
+                    existing.cellKey === event.cursor.cell &&
+                    existing.name === event.peer.name &&
+                    existing.color === event.peer.color &&
+                    existing.doc === event.cursor.doc &&
+                    existing.stmtId === event.cursor.stmtId
+                ) {
+                    return prev;
+                }
+                return {
+                    ...prev,
+                    [event.peer.id]: {
+                        id: event.peer.id,
+                        name: event.peer.name,
+                        color: event.peer.color,
+                        cellKey: event.cursor.cell,
+                        doc: event.cursor.doc,
+                        stmtId: event.cursor.stmtId,
+                    },
+                };
+            });
+        },
+        [computeCellPos],
+    );
+
+    const onLeave = useCallback((peerId: string) => {
+        delete peerCursorsRef.current[peerId];
+        delete cursorMotion.current[peerId];
+        setPeerCells((prev) => {
+            if (!(peerId in prev)) return prev;
+            const next = { ...prev };
+            delete next[peerId];
+            return next;
+        });
+    }, []);
+
+    const { peers, connected, sendCursor, sendEdit, room } = usePresence(identity, { onRemoteEdit, onCursor, onLeave });
     const peerList = Object.values(peers);
     /* Simulated teammates only keep you company while you're alone. */
     const hasRealPeers = peerList.length > 0;
@@ -334,22 +416,27 @@ export const ReportBuilder = () => {
                 if (person)
                     targets.push({
                         person: { ...person, label: person.name.split(" ")[0] },
-                        rowId: sel.rowId,
-                        col: sel.col,
+                        cellKey: `${sel.rowId}:${sel.col}`,
                         fx: 0.35,
                         fy: 0.45,
                         sim: true,
                     });
             }
         }
-        for (const peer of peerList) {
-            if (peer.cursor && peer.cursor.doc === doc && peer.cursor.stmtId === statement.id) {
-                targets.push({ person: peer, rowId: peer.cursor.rowId, col: peer.cursor.col, fx: peer.cursor.fx, fy: peer.cursor.fy });
+        for (const pc of Object.values(peerCells)) {
+            if (pc.doc === doc && pc.stmtId === statement.id) {
+                const lastEvent = peerCursorsRef.current[pc.id];
+                targets.push({
+                    person: { id: pc.id, name: pc.name, color: pc.color },
+                    cellKey: pc.cellKey,
+                    fx: lastEvent?.cursor.fx ?? 0.5,
+                    fy: lastEvent?.cursor.fy ?? 0.5,
+                });
             }
         }
         return targets;
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [selections, peers, hasRealPeers, doc, statement.id]);
+    }, [selections, peerCells, hasRealPeers, doc, statement.id]);
 
     /* Convert cell targets to pixel positions and feed them to the animation loop. */
     const updateCursorTargets = useCallback(() => {
@@ -359,15 +446,21 @@ export const ReportBuilder = () => {
         const sharedCount: Record<string, number> = {};
         const seen = new Set<string>();
         for (const target of cursorTargets) {
-            const cell = grid.querySelector(`[data-cell="${target.rowId}:${target.col}"]`);
+            const cell = grid.querySelector(`[data-cell="${target.cellKey}"]`);
             if (!cell) continue;
-            /* Fan out cursors that share a cell so the arrows stay distinguishable. */
-            const key = `${target.rowId}:${target.col}`;
-            const stackIndex = sharedCount[key] ?? 0;
-            sharedCount[key] = stackIndex + 1;
+            /* Fan out only SIMULATED cursors that share a cell. Real cursors render at
+               their exact reported position — offsetting them would read as snapping. */
+            let fanX = 0;
+            let fanY = 0;
+            if (target.sim) {
+                const stackIndex = sharedCount[target.cellKey] ?? 0;
+                sharedCount[target.cellKey] = stackIndex + 1;
+                fanX = stackIndex * 16;
+                fanY = stackIndex * 6;
+            }
             const rect = cell.getBoundingClientRect();
-            const x = rect.left - gridRect.left + rect.width * target.fx + grid.scrollLeft + stackIndex * 16;
-            const y = rect.top - gridRect.top + rect.height * target.fy + grid.scrollTop + stackIndex * 6;
+            const x = rect.left - gridRect.left + rect.width * target.fx + grid.scrollLeft + fanX;
+            const y = rect.top - gridRect.top + rect.height * target.fy + grid.scrollTop + fanY;
 
             const id = target.person.id;
             seen.add(id);
@@ -393,14 +486,20 @@ export const ReportBuilder = () => {
         return () => window.removeEventListener("resize", updateCursorTargets);
     }, [updateCursorTargets]);
 
-    /* 60fps easing loop: real cursors snap-follow (~80ms settle), sims drift lazily. */
+    /* 60fps easing loop with time-based exponential smoothing: real cursors track
+       tightly (~70ms time constant — hides network burst jitter without visible lag),
+       sims drift lazily. Frame-rate independent. */
     useEffect(() => {
         let raf = 0;
-        const tick = () => {
+        let last = performance.now();
+        const tick = (now: number) => {
+            const dt = Math.min(100, now - last);
+            last = now;
             for (const [id, motion] of Object.entries(cursorMotion.current)) {
                 const el = cursorEls.current.get(id);
                 if (!el) continue;
-                const k = motion.sim ? 0.06 : 0.45;
+                const tau = motion.sim ? 420 : 70;
+                const k = 1 - Math.exp(-dt / tau);
                 motion.x += (motion.tx - motion.x) * k;
                 motion.y += (motion.ty - motion.y) * k;
                 el.style.transform = `translate(${motion.x}px, ${motion.y}px)`;
@@ -411,19 +510,19 @@ export const ReportBuilder = () => {
         return () => cancelAnimationFrame(raf);
     }, []);
 
-    /* Broadcast my own cursor as I move over the grid. */
+    /* Broadcast my own cursor as I move anywhere over the grid — every cell
+       (labels, column headers, tags, sources) carries a data-cell anchor. */
     const handleGridMouseMove = useCallback(
         (e: React.MouseEvent<HTMLDivElement>) => {
             const cell = (e.target as HTMLElement).closest?.("[data-cell]");
             if (!cell) return;
-            const [rowId, colStr] = (cell.getAttribute("data-cell") ?? "").split(":");
-            if (!rowId) return;
+            const cellKey = cell.getAttribute("data-cell");
+            if (!cellKey) return;
             const rect = cell.getBoundingClientRect();
             sendCursor({
                 doc,
                 stmtId: statement.id,
-                rowId,
-                col: Number(colStr),
+                cell: cellKey,
                 fx: Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)),
                 fy: Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height)),
             });
@@ -488,7 +587,7 @@ export const ReportBuilder = () => {
     const selectionByRow = useMemo(() => {
         const map: Record<string, PresencePerson[]> = {};
         for (const target of cursorTargets) {
-            (map[`${target.rowId}:${target.col}`] ??= []).push(target.person);
+            (map[target.cellKey] ??= []).push(target.person);
         }
         return map;
     }, [cursorTargets]);
@@ -608,16 +707,20 @@ export const ReportBuilder = () => {
                 <table className="w-full min-w-[960px] border-collapse">
                     <thead className="sticky top-0 z-20 bg-secondary_subtle">
                         <tr className="border-b border-secondary text-left">
-                            <th className="px-4 py-2.5 text-xs font-semibold text-quaternary">
+                            <th data-cell="head:label" className="px-4 py-2.5 text-xs font-semibold text-quaternary">
                                 {statement.name} <span className="font-normal">(in thousands)</span>
                             </th>
-                            {statement.columns.map((col) => (
-                                <th key={col} className="w-44 px-4 py-2.5 text-right text-xs font-semibold text-quaternary">
+                            {statement.columns.map((col, i) => (
+                                <th key={col} data-cell={`head:${i}`} className="w-44 px-4 py-2.5 text-right text-xs font-semibold text-quaternary">
                                     {col}
                                 </th>
                             ))}
-                            <th className="w-78 px-3 py-2.5 text-xs font-semibold text-quaternary">XBRL tag</th>
-                            <th className="w-44 px-3 py-2.5 text-xs font-semibold text-quaternary max-lg:hidden">Source</th>
+                            <th data-cell="head:tag" className="w-78 px-3 py-2.5 text-xs font-semibold text-quaternary">
+                                XBRL tag
+                            </th>
+                            <th data-cell="head:src" className="w-44 px-3 py-2.5 text-xs font-semibold text-quaternary max-lg:hidden">
+                                Source
+                            </th>
                         </tr>
                     </thead>
                     <tbody>
@@ -634,6 +737,7 @@ export const ReportBuilder = () => {
                                     )}
                                 >
                                     <td
+                                        data-cell={`${row.id}:label`}
                                         className={cx(
                                             "px-4 py-2 text-sm",
                                             row.kind === "header" && "pt-3 font-semibold text-primary",
@@ -668,7 +772,7 @@ export const ReportBuilder = () => {
                                         }}
                                         onAccept={() => dispatch({ type: "ACCEPT_TAG", doc, stmtId: statement.id, rowId: row.id })}
                                     />
-                                    <td className="px-3 py-2 max-lg:hidden">
+                                    <td data-cell={`${row.id}:src`} className="px-3 py-2 max-lg:hidden">
                                         {row.kind !== "header" && row.source && (
                                             <span className="inline-flex max-w-full items-center gap-1.5 text-xs text-tertiary">
                                                 {SourceIcon && <SourceIcon className="size-3.5 shrink-0 text-fg-quaternary" />}
